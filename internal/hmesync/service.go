@@ -107,6 +107,7 @@ type Service struct {
 	operationLock                map[int64]*operationLock
 	accountAuthChallenges        map[int64]accountAuthChallenge
 	creationCooldowns            map[int64]map[string]time.Time
+	retirementReadCooldowns      map[int64]time.Time
 }
 
 func New(repo Repository, cipher SessionCipher, client AppleClient, locker AccountLocker, options ...Option) (*Service, error) {

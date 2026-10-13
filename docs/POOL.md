@@ -102,6 +102,25 @@ curl 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-
 }
 ```
 
+### 退休作业核验与显式恢复
+
+未知结果先用上述 GET 找回原作业快照；GET 和原始 `POST /aliases/batch` 的幂等重放都不会恢复执行。核验或恢复使用 `POST <admin-path>/api/v1/pool/aliases/batch/jobs/:operationID/reconcile`，仍要求管理员 Session、同源 CSRF 和原项目 Pool Key：
+
+```sh
+curl -X POST 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-20260918-0001/reconcile' \
+  -H 'Cookie: icloud_admin_session=ADMIN_SESSION' \
+  -H 'X-CSRF-Token: ADMIN_CSRF' \
+  -H 'Authorization: Bearer pool_PROJECT_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"alias_id":123,"lease_id":"LEASE_ID"}],"resume":false}'
+```
+
+- 请求必须携带原作业完整、顺序完全一致的 `items`（包含原 `alias_id`、`lease_id`），以及布尔值 `resume`。成功返回 `202`，响应与读取作业的 DTO 相同。作业缺失或属于其他项目返回 `404`；items 内容或顺序变化返回 `409 IDEMPOTENCY_CONFLICT`。
+- `resume=false` 只读取完整、权威的 Apple 目录。确认地址 absent 后，仅对原 alias/lease 精确绑定执行本地退休收口；确认 present 时保持 `review`，结果码为 `APPLE_ALIAS_STILL_PRESENT`，不发送删除。
+- `resume=true` 是明确的再次删除授权：重新读取完整、权威目录，fresh 确认 present 后沿原删除流程执行；确认 absent 时直接执行原绑定的退休收口。目录读取失败或结果未知时保持 `review`，lease 仍锁在 `retiring`，不开放取码、续期、释放、确认使用或再次领取，也不自动重放未知副作用。
+- 同一主号的目录核验和删除串行执行。Apple `RetryAfter` 使用独立 cooldown，最短一分钟。原作业核验/恢复在途时，同一 `resume` 返回当前快照；不同 `resume` 返回 `409 RETIREMENT_ACTION_CONFLICT`。
+- worker 结束后再次显式 POST 会启动新一轮核验或恢复；`operationID` 标识原作业，并非核验/恢复请求的 at-most-once 标识。响应丢失时先 GET 恢复未知状态，再决定是否明确授权下一轮。
+
 成功响应形状：
 
 ```json

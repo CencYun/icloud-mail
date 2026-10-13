@@ -17,11 +17,12 @@ import (
 const poolAliasRetirementJobTimeout = 2 * time.Hour
 
 type poolAliasRetirementJobRuntime struct {
-	mu       sync.Mutex
-	ctx      context.Context
-	active   map[string]struct{}
-	stopping bool
-	wg       sync.WaitGroup
+	mu              sync.Mutex
+	ctx             context.Context
+	active          map[string]struct{}
+	reconcileResume map[string]bool
+	stopping        bool
+	wg              sync.WaitGroup
 }
 
 type poolAliasRetirementRequest struct {
@@ -33,6 +34,7 @@ func (s *Server) registerPoolAliasRetirementRoutes(api *gin.RouterGroup) {
 	api.Use(s.poolAuth())
 	api.POST("/aliases/batch", s.adminAPIPoolAliasRetirementStart)
 	api.GET("/aliases/batch/jobs/:operationID", s.adminAPIPoolAliasRetirementGet)
+	api.POST("/aliases/batch/jobs/:operationID/reconcile", s.adminAPIPoolAliasRetirementReconcile)
 }
 
 // StartPoolAliasRetirementJobs marks abandoned work interrupted before this
@@ -49,6 +51,7 @@ func (s *Server) StartPoolAliasRetirementJobs(ctx context.Context) error {
 	}
 	runtime.ctx = ctx
 	runtime.active = make(map[string]struct{})
+	runtime.reconcileResume = make(map[string]bool)
 	return nil
 }
 
@@ -85,6 +88,15 @@ func (s *Server) adminAPIPoolAliasRetirementStart(c *gin.Context) {
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
 		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	ownedByAnother, err := s.store.PoolAliasRetirementOperationOwnedByAnother(c.Request.Context(), input.OperationID, client.ID)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	if ownedByAnother {
+		writeAdminAPIError(c, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "operation_id 已用于不同的删除项目")
 		return
 	}
 	if err := store.ValidatePoolAliasRetirementInput(input.OperationID, input.Items); err != nil {
@@ -264,6 +276,9 @@ func (s *Server) runPoolAliasRetirementJob(parent context.Context, client store.
 	byAlias := make(map[int64]int, len(job.Items))
 	ids := make([]int64, 0, len(job.Items))
 	for _, item := range job.Items {
+		if item.State != "retiring" {
+			continue
+		}
 		byAlias[item.AliasID] = item.Ordinal
 		ids = append(ids, item.AliasID)
 	}
@@ -338,20 +353,24 @@ func (s *Server) runPoolAliasRetirementJob(parent context.Context, client store.
 }
 
 func (s *Server) interruptPoolAliasRetirementJob(job store.PoolAliasRetirementJob, client store.PoolClient, code, message string) {
-	current, err := s.store.GetPoolAliasRetirementJob(context.Background(), job.OperationID, client.ID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	current, err := s.store.GetPoolAliasRetirementJob(ctx, job.OperationID, client.ID)
 	if err != nil {
 		return
 	}
 	for _, item := range current.Items {
 		if item.State == "retiring" {
-			_ = s.store.MarkPoolAliasRetirementReview(context.Background(), job.OperationID, item.Ordinal, code, message)
+			_ = s.store.RecordPoolAliasRetirementReconcileReview(ctx, client.ID, job.OperationID, item.Ordinal, code, message)
 		}
 	}
-	_ = s.store.SetPoolAliasRetirementJobStatus(context.Background(), job.OperationID, client.ID, store.PoolAliasRetirementJobInterrupted)
+	_ = s.store.SetPoolAliasRetirementJobStatus(ctx, job.OperationID, client.ID, store.PoolAliasRetirementJobInterrupted)
 }
 
 func (s *Server) markPoolAliasRetirementReview(job store.PoolAliasRetirementJob, ordinal int, code, message string) {
-	if err := s.store.MarkPoolAliasRetirementReview(context.Background(), job.OperationID, ordinal, code, message); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.store.RecordPoolAliasRetirementReconcileReview(ctx, job.ClientID, job.OperationID, ordinal, code, message); err != nil {
 		s.logger.Error("保存邮箱池退休删除待核查状态失败", "operation_id", job.OperationID, "ordinal", ordinal, "request_id", job.RequestID)
 	}
 }
@@ -367,12 +386,25 @@ func poolAliasRetirementOutcomeUnknown(err error) bool {
 		errors.Is(err, hmesync.ErrRateLimited) || errors.Is(err, hmesync.ErrBatchDeferred) {
 		return true
 	}
+	for _, definite := range []error{hmesync.ErrAccountDisabled, hmesync.ErrAccountChanged, hmesync.ErrAccountMismatch,
+		hmesync.ErrAliasOwnershipConflict, hmesync.ErrAliasConfirmationPending, hmesync.ErrCredentialsInvalid,
+		hmesync.ErrAccountActionRequired, hmesync.ErrVerificationInvalid, hmesync.ErrHMEUnavailable} {
+		if errors.Is(err, definite) {
+			return false
+		}
+	}
 	switch hmesync.Code(err) {
 	case hmesync.CodeUpstreamError, hmesync.CodePersistenceError, hmesync.CodeCryptoError,
 		hmesync.CodeRateLimited, hmesync.CodeBatchDeferred, hmesync.CodeSessionExpired, hmesync.CodeLoginRequired:
 		return true
-	default:
+	case hmesync.CodeAccountDisabled, hmesync.CodeAccountChanged, hmesync.CodeAccountMismatch,
+		hmesync.CodeAliasOwnershipConflict, hmesync.CodeAliasConfirmationPending, hmesync.CodeCredentialsInvalid,
+		hmesync.CodeAccountActionRequired, hmesync.CodeVerificationInvalid, hmesync.CodeHMEUnavailable:
 		return false
+	default:
+		// An unclassified transport/adapter error is not a definitive Apple
+		// rejection. Keep the lease closed until a complete read confirms it.
+		return true
 	}
 }
 

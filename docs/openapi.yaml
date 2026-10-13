@@ -916,6 +916,90 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminAppleErrorResponse"
 
+  /api/v1/pool/aliases/batch/jobs/{operationID}/reconcile:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 安装级管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+      - url: https://HOST/admin
+        description: 固定兼容管理入口
+    post:
+      tags: [Mailbox Pool, Administration]
+      operationId: reconcilePoolAliasRetirementJob
+      summary: 核验原退休作业或显式授权恢复删除
+      description: |
+        要求管理员 Session、同源 CSRF 和原项目 Pool Key。items 必须与原作业完整、顺序完全一致，
+        包含原 alias_id、lease_id。作业缺失或属于其他项目返回 404；items 不匹配返回
+        409 IDEMPOTENCY_CONFLICT。同作业核验/恢复在途时，相同 resume 返回当前快照，
+        不同 resume 返回 409 RETIREMENT_ACTION_CONFLICT。
+
+        resume=false 只读取完整、权威的 Apple 目录：确认 absent 后仅对原 alias/lease 精确绑定
+        执行本地退休收口；确认 present 保持 review，结果码 APPLE_ALIAS_STILL_PRESENT，不删除。
+        resume=true 明确授权再次删除；fresh 完整权威目录确认 present 后沿原删除流程执行，
+        确认 absent 则执行原绑定的退休收口。目录读取失败或结果未知时保持 review，lease 保持
+        retiring，不开放租约操作，也不自动重放未知副作用。
+
+        每主号串行核验和删除；Apple RetryAfter 使用独立 cooldown，最短一分钟。
+        worker 结束后显式 POST 是新一轮动作，operationID 是原作业标识，并非该请求的
+        at-most-once 标识。原 POST 的幂等重放不恢复；响应未知时先 GET 恢复作业快照。
+      security:
+        - adminSession: []
+          poolKey: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+        - name: operationID
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 16
+            maxLength: 128
+            pattern: '^[A-Za-z0-9_-]{16,128}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PoolAliasRetirementReconcileRequest"
+      responses:
+        "202":
+          description: 核验或恢复已接收，或返回同一在途动作的快照；不表示全部删除已完成。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminAliasBatchDeleteCacheControl"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolAliasRetirementJobResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          description: 作业不存在或属于其他 Pool Key 项目。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "409":
+          description: items 不匹配时为 IDEMPOTENCY_CONFLICT；同一作业在途动作的 resume 不同则为 RETIREMENT_ACTION_CONFLICT。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "503":
+          description: 后台作业服务未启动、正在关闭或 Apple 服务不可用。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+
   /api/v1/pool/aliases/batch/jobs/{operationID}:
     servers:
       - url: https://HOST/{admin_path}
@@ -2657,6 +2741,21 @@ components:
           maxItems: 100
           items:
             $ref: "#/components/schemas/PoolAliasRetirementItemRequest"
+    PoolAliasRetirementReconcileRequest:
+      type: object
+      additionalProperties: false
+      required: [items, resume]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: 原作业完整 items；alias_id、lease_id 和顺序必须完全一致。
+          items:
+            $ref: "#/components/schemas/PoolAliasRetirementItemRequest"
+        resume:
+          type: boolean
+          description: false 仅核验权威目录；true 明确授权 fresh 确认地址 present 后恢复原删除流程。
     PoolAliasRetirementItemRequest:
       type: object
       additionalProperties: false
