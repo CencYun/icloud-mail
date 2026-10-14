@@ -273,24 +273,29 @@ func (s *Server) runPoolAliasRetirementJob(parent context.Context, client store.
 		return
 	}
 
-	byAlias := make(map[int64]int, len(job.Items))
+	byAlias := make(map[int64]store.PoolAliasRetirementJobItem, len(job.Items))
 	ids := make([]int64, 0, len(job.Items))
 	for _, item := range job.Items {
 		if item.State != "retiring" {
 			continue
 		}
-		byAlias[item.AliasID] = item.Ordinal
+		byAlias[item.AliasID] = item
 		ids = append(ids, item.AliasID)
 	}
 	seen := make(map[int64]bool, len(job.Items))
 	record := func(outcome hmesync.AliasDeletionOutcome) {
-		ordinal, exists := byAlias[outcome.AliasID]
+		item, exists := byAlias[outcome.AliasID]
 		if !exists || seen[outcome.AliasID] {
 			return
 		}
 		seen[outcome.AliasID] = true
+		ordinal := item.Ordinal
 		if outcome.Err == nil {
-			if err := s.store.FinalizePoolAliasRetirement(context.Background(), job.OperationID, ordinal, outcome.AliasID); err == nil {
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second)
+			defer cancel()
+			if err := s.withAccountLock(persistCtx, item.AccountID, func() error {
+				return s.store.FinalizePoolAliasRetirement(persistCtx, job.OperationID, ordinal, outcome.AliasID)
+			}); err == nil {
 				return
 			}
 			s.markPoolAliasRetirementReview(job, ordinal, "APPLE_DELETE_UNCERTAIN", "Apple 删除已确认但本地收口未完成，需要人工核对")
@@ -309,7 +314,9 @@ func (s *Server) runPoolAliasRetirementJob(parent context.Context, client store.
 	// progress callback. Keep Pool state writes outside that callback: Pool
 	// mutations lock Pool before account rows, whereas the Apple executor holds
 	// an account lock. A no-op finalizer prevents its default local delete;
-	// outcomes are published below after all account locks have been released.
+	// outcomes are published below after the Apple executor releases its locks.
+	// Reacquire the account's process lock before opening the Pool transaction,
+	// so local deletion cannot invalidate an in-flight mailbox publication.
 	ctx = hmesync.WithAliasDeletionRecovery(ctx, nil)
 	ctx = hmesync.WithAliasDeletionFinalizer(ctx, func(context.Context, int64) error { return nil })
 

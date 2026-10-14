@@ -151,7 +151,9 @@ func (s *Server) runPoolAliasRetirementReconcile(parent context.Context, client 
 			continue
 		}
 		if !observation.Present {
-			if err := s.store.FinalizeReconciledPoolAliasRetirement(ctx, client.ID, job.OperationID, item.Ordinal); err != nil {
+			if err := s.withAccountLock(ctx, item.AccountID, func() error {
+				return s.store.FinalizeReconciledPoolAliasRetirement(ctx, client.ID, job.OperationID, item.Ordinal)
+			}); err != nil {
 				s.recordPoolRetirementReconcileReview(ctx, client, job, item.Ordinal, "POOL_RETIREMENT_CONFLICT", "远端目标已不存在，本地原绑定需核对")
 			}
 			continue
