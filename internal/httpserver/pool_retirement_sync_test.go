@@ -43,7 +43,7 @@ func (f *retirementSyncFetcher) FetchActiveIncremental(ctx context.Context, acco
 	return f.FetchIncremental(ctx, account, password, aliases, previous, positions)
 }
 
-func TestPoolRetirementPublicationWaitsForActiveSync(t *testing.T) {
+func TestPoolRetirementPublicationRunsDuringActiveSync(t *testing.T) {
 	for _, reconcile := range []bool{false, true} {
 		name := "delete_receipt"
 		if reconcile {
@@ -130,18 +130,16 @@ func TestPoolRetirementPublicationWaitsForActiveSync(t *testing.T) {
 			}()
 			defer func() { cancel(); <-finished }()
 			select {
-			case <-publicationEntered:
 			case <-finished:
-				t.Fatal("retirement changed aliases while active sync held the account lock")
 			case <-ctx.Done():
-				t.Fatal("retirement did not reach publication")
+				t.Fatal("retirement waited for unrelated IMAP network work")
 			}
 			current, err := env.store.GetPoolLease(ctx, lease.ID, client.ID)
-			if err != nil || current.State != "retiring" || current.AliasID != lease.AliasID {
+			if err != nil || current.State != "retired" || current.AliasID != 0 {
 				t.Fatalf("lease changed during active fetch: state=%s err=%v", current.State, err)
 			}
-			if _, err := env.store.GetAlias(ctx, lease.AliasID); err != nil {
-				t.Fatalf("alias disappeared during active fetch: %v", err)
+			if _, err := env.store.GetAlias(ctx, lease.AliasID); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("retired alias remained during active fetch: %v", err)
 			}
 			otherCtx, cancelOther := context.WithTimeout(ctx, time.Second)
 			err = manager.WithAccountLock(otherCtx, account.ID+1, func() error { return nil })

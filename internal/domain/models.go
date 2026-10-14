@@ -63,6 +63,9 @@ type Account struct {
 	// mailboxes. It is deliberately separate from Email, which remains the
 	// legacy iCloud identity used by Apple sessions and external API lookups.
 	EmailSuffix string
+	// Configuration revisions exclude alias mutations and sync health writes.
+	MailboxConfigVersion int64 `json:"-"`
+	MailTransportVersion int64 `json:"-"`
 }
 
 // AppleWebSession stores the encrypted Apple web session associated with an
@@ -140,6 +143,7 @@ type Alias struct {
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 	LatestReceivedAt     *time.Time
+	ReceiveRevision      int64 `json:"-"`
 }
 
 // MailGroup is an administrator-defined collection of privacy mailboxes.
