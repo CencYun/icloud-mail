@@ -278,3 +278,55 @@ func TestObservedAliasMailboxSyncSurvivesUnrelatedDeletion(t *testing.T) {
 		t.Fatalf("unrelated deletion suppressed auth pause: %v", err)
 	}
 }
+
+func TestObservedMailboxStaleSourceDoesNotOverwriteCurrentArchive(t *testing.T) {
+	for _, targeted := range []bool{false, true} {
+		name := "shared"
+		if targeted {
+			name = "targeted"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			db, _, alias, second := aliasIMAPSyncFixture(t)
+			oldSource, err := db.GetAccount(ctx, alias.AccountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newSource := oldSource
+			newSource.IMAPHost = "replacement.example.test"
+			newSource, err = db.UpdateAccount(ctx, newSource)
+			if err != nil {
+				t.Fatal(err)
+			}
+			aliases, err := db.ListEnabledAliasesByAccount(ctx, alias.AccountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().UTC()
+			current := aliasIMAPSyncResult(alias, 91, 10, at)
+			current.ArchivedMessages[0].RawMIME = []byte("To: fixture@icloud.com\r\n\r\ncurrent source body")
+			if err := db.ApplyObservedMailboxSync(ctx, newSource, aliases, current, at); err != nil {
+				t.Fatal(err)
+			}
+			stale := aliasIMAPSyncResult(alias, 91, 10, at)
+			stale.ArchivedMessages[0].RawMIME = []byte("To: fixture@icloud.com\r\n\r\nold source different body")
+			if targeted {
+				err = db.ApplyObservedAliasMailboxSync(ctx, oldSource, alias, stale, at, false)
+			} else {
+				err = db.ApplyObservedMailboxSync(ctx, oldSource, []domain.Alias{alias, second}, stale, at)
+			}
+			// Archive identity conflicts may reject the input before the source check.
+			if err == nil {
+				t.Fatal("old source accepted")
+			}
+			messages, err := db.ListArchivedMailboxMessages(ctx, alias.ID)
+			if err != nil || len(messages) != 1 {
+				t.Fatalf("current archive missing: %v", err)
+			}
+			body, err := db.ReadArchivedContent(messages[0])
+			if err != nil || string(body) != string(current.ArchivedMessages[0].RawMIME) {
+				t.Fatalf("stale source damaged current archive: %v", err)
+			}
+		})
+	}
+}
