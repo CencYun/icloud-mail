@@ -2,7 +2,7 @@
 
 自托管的 **iCloud 隐藏邮箱管理、邮箱池与 API 取码服务**，带本地化 Web 控制面板。
 
-**当前版本：v0.2.2** · [下载与发布说明](https://github.com/t508708/icloud-mail/releases/tag/v0.2.2) · [更新日志](CHANGELOG.md) · [安装文档](DELIVERY.md)
+**当前版本：v0.2.3** · [下载与发布说明](https://github.com/t508708/icloud-mail/releases/tag/v0.2.3) · [更新日志](CHANGELOG.md) · [安装文档](DELIVERY.md)
 
 ## 核心功能
 
@@ -15,10 +15,12 @@
 | 邮件接收 | 按需增量收件、同主号连接复用、MIME 归档、只读 IMAPS |
 | 独立凭据 | 每邮箱 API Key、IMAP 密码及 OAuth 凭据，由本网关签发 |
 
-## v0.2.2 更新重点
+## v0.2.3 更新重点
 
-- **直接部署**：应用与 PostgreSQL 镜像发布到 GHCR，默认使用自动更新的 `latest`，同时支持 amd64 和 arm64。
-- **项目入口**：仓库已迁移为独立项目并保留上游来源与许可说明；后台和 README 增加 QQ 群入口。
+- **退役与收件并行**：同主号的 Apple 管理与 IMAP 读取独立执行；退役一个邮箱不再阻塞其他邮箱收件或丢弃其整批归档。
+- **原工单核验与恢复**：通过完整权威目录核验外部退役；显式恢复原目标，未知结果保持待核查，避免重复删除。
+- **归档一致性**：保存前核验账户配置及邮箱启停修订，旧连接结果不会污染新配置；严格保留完整地址优先与同域 `+tag` 归属。
+- **接口文档同步**：内置 `/docs/` 更新取码、Pool、退役核验、限流重试与并行边界。Docker 继续默认拉取多架构 `latest`。
 
 从初版 `v0.1.0` 起的完整新增、调整、修复与验证记录见 [更新日志](CHANGELOG.md)。
 
@@ -81,6 +83,8 @@ docker compose -f compose.yaml -f compose.build.yaml up -d --build --wait
 [安装与升级](DELIVERY.md) · [公网部署](docs/PUBLIC.md) · [邮箱池与 API](docs/POOL.md) · [OpenAPI](docs/openapi.yaml)
 
 [配置与兼容说明](docs/REFERENCE.md) · [收件设计](docs/MAIL-RECEPTION.md) · [测试与实测记录](docs/RECEIVER-VALIDATION.md)
+
+每个部署的 `/docs/` 提供随服务版本更新的公开接入说明；对应源码见 [内置接口文档](internal/httpserver/docs.html)。
 
 ## 来源与许可
 
