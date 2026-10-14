@@ -82,6 +82,34 @@ func (s *Service) GetAccountSession(ctx context.Context, id int64) (SessionInfo,
 	return info, nil
 }
 
+func accountCreationSessionUsable(session *apple.AccountSession, now time.Time) bool {
+	return session != nil && session.APIKey != "" && !session.RefreshRejected &&
+		(session.ExpiresAt.IsZero() || session.ExpiresAt.After(now))
+}
+
+// Local-only scheduler preflight. A failed ACC refresh does not invalidate Web.
+func (s *Service) CreationChannelAvailability(ctx context.Context, id int64) (domain.CreationChannelAvailability, error) {
+	var result domain.CreationChannelAvailability
+	account, err := s.repo.GetAccount(ctx, id)
+	if err != nil || !account.Enabled {
+		return result, err
+	}
+	web, err := s.GetSession(ctx, id)
+	if err != nil {
+		return result, err
+	}
+	result.ICloudWeb = web.Status == StatusAuthenticated
+	managed, err := s.readAccountManagementSession(ctx, id)
+	if errors.Is(err, store.ErrNotFound) || Code(err) == CodeAccountSessionExpired {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	result.AppleAccount = accountCreationSessionUsable(managed, s.now()) && sameEmail(managed.AppleID, web.AppleID)
+	return result, nil
+}
+
 // Refresh under the same account lock as creation, so waiting batches retain
 // management cookies without overwriting concurrent Web-session changes.
 func (s *Service) KeepAliveAccountSession(ctx context.Context, id int64) error {
@@ -338,11 +366,13 @@ func (s *Service) createRemoteAliasWithMode(ctx context.Context, id int64, web a
 	channels := []string{channel}
 	if channel == "auto" {
 		channels = []string{"icloud_web"}
-		if web.Account != nil && web.Account.APIKey != "" {
+		if accountCreationSessionUsable(web.Account, s.now()) && !domain.WebOnlyCreation(ctx) {
 			channels = []string{"apple_account", "icloud_web"}
 			if domain.ScheduledCreationChannel(ctx) == "icloud_web" && !probe {
 				channels = []string{"icloud_web", "apple_account"}
 			}
+		} else if !probe {
+			ctx = domain.WithWebOnlyCreation(ctx)
 		}
 	}
 	var earliest time.Time
@@ -379,11 +409,27 @@ func (s *Service) createRemoteAliasWithMode(ctx context.Context, id int64, web a
 			if !sameEmail(web.Account.AppleID, web.AppleID) {
 				return alias, web, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 			}
+			previous := *web.Account
 			var managed apple.AccountSession
 			alias, managed, err = client.CreateAccountAlias(ctx, *web.Account, label, note)
 			web.Account = &managed
 			if errors.Is(err, apple.ErrInvalidSession) {
 				// Keep Web authentication available for synchronization and OTP.
+				if managed.APIKey == "" {
+					managed = previous
+				}
+				if !sameEmail(managed.AppleID, previous.AppleID) {
+					return alias, web, wrapError(CodeAccountMismatch, ErrAccountMismatch, err)
+				}
+				managed.RefreshRejected = true
+				managed.UpdatedAt = s.now()
+				web.Account = &managed
+				persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
+				persistErr := s.saveAccountManagementSession(persistCtx, id, managed)
+				cancel()
+				if persistErr != nil {
+					return alias, web, errors.Join(wrapPersistenceError(persistErr), err)
+				}
 				err = wrapError(CodeAccountSessionExpired, ErrUpstream, err)
 			}
 		} else {

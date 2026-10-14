@@ -67,6 +67,9 @@ func appleCreationChannelLimit(channel string) (int, bool) {
 // ClaimAppleChannelCreationAttempt consumes one channel's rolling hourly budget.
 func (s *Store) ClaimAppleChannelCreationAttempt(ctx context.Context, accountID int64, channel string, now time.Time) error {
 	limit, ok := appleCreationChannelLimit(channel)
+	if channel == icloudWebCreationChannel && domain.WebOnlyCreation(ctx) {
+		limit = domain.ICloudWebOnlyCreationHourlyLimit
+	}
 	if accountID < 1 || now.IsZero() || !ok {
 		return errors.New("claim Apple channel creation attempt: invalid account or channel")
 	}
