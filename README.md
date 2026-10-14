@@ -4,6 +4,8 @@
 
 **当前版本：v0.2.3** · [下载与发布说明](https://github.com/t508708/icloud-mail/releases/tag/v0.2.3) · [更新日志](CHANGELOG.md) · [安装文档](DELIVERY.md)
 
+`latest` 已追加[自动创建通道降级修复](docs/AUTO_CREATION_CHANNELS.md)：新通道过期时，旧通道每小时最多尝试 5 次；重新登录新通道后自动恢复 19＋4，已有额度与冷却继续保留。
+
 ## 核心功能
 
 | 功能 | 说明 |
@@ -83,6 +85,8 @@ docker compose -f compose.yaml -f compose.build.yaml up -d --build --wait
 [安装与升级](DELIVERY.md) · [公网部署](docs/PUBLIC.md) · [邮箱池与 API](docs/POOL.md) · [OpenAPI](docs/openapi.yaml)
 
 [配置与兼容说明](docs/REFERENCE.md) · [收件设计](docs/MAIL-RECEPTION.md) · [测试与实测记录](docs/RECEIVER-VALIDATION.md)
+
+[自动创建与通道恢复](docs/AUTO_CREATION_CHANNELS.md)
 
 每个部署的 `/docs/` 提供随服务版本更新的公开接入说明；对应源码见 [内置接口文档](internal/httpserver/docs.html)。
 
