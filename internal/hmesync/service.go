@@ -948,7 +948,7 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 	}
 	confirmAccountDetail := func(candidate apple.Alias, session apple.Session) (apple.Alias, apple.Session, error) {
 		reader, ok := s.client.(accountAliasReader)
-		if !ok || session.Account == nil || candidate.AnonymousID == "" || !candidate.IsActive {
+		if !ok || session.Account == nil || candidate.AnonymousID == "" {
 			return candidate, session, nil
 		}
 		confirmed, managed, readErr := reader.GetAccountAlias(ctx, *session.Account, candidate)

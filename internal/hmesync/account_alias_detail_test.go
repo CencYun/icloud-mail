@@ -41,6 +41,7 @@ func TestCreationConfirmsAccountDetailWhenListsOmitAddress(t *testing.T) {
 		readErr error
 	}{
 		{"new", false, 0, "primary@icloud.com", nil},
+		{"inactive_completion_active_detail", false, 0, "primary@icloud.com", nil},
 		{"recent_pending", true, time.Minute, "primary@icloud.com", nil},
 		{"old_pending", true, time.Hour, "primary@icloud.com", nil},
 		{"other_forward", true, time.Minute, "other@icloud.com", nil},
@@ -54,6 +55,9 @@ func TestCreationConfirmsAccountDetailWhenListsOmitAddress(t *testing.T) {
 			}
 			lists, details, completes := 0, 0, 0
 			candidate := apple.Alias{HME: "root@icloud.com", AnonymousID: "remote-id", IsActive: true, Origin: "APPLE_ACCOUNT"}
+			if tc.name == "inactive_completion_active_detail" {
+				candidate.IsActive = false
+			}
 			client := &detailPendingClient{}
 			client.validate = func(_ context.Context, s apple.Session) (apple.Session, error) { return s, nil }
 			client.list = func(_ context.Context, s apple.Session) (apple.ListResult, apple.Session, error) {
@@ -71,6 +75,7 @@ func TestCreationConfirmsAccountDetailWhenListsOmitAddress(t *testing.T) {
 				details++
 				s.SCNT = "rotated"
 				a.ForwardToEmail = tc.forward
+				a.IsActive = true
 				return a, s, tc.readErr
 			}
 			service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
