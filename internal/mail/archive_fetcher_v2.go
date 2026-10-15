@@ -918,60 +918,77 @@ func fetchArchivedMessages(
 	defer command.Close()
 	found := make(map[uint32]bool, fetchCount)
 	staged := make(map[uint32]string, fetchCount)
+	var pendingPath string
 	cleanup := func() {
+		if pendingPath != "" {
+			_ = os.Remove(pendingPath)
+		}
 		for _, path := range staged {
 			_ = os.Remove(path)
 		}
 	}
 	for message := command.Next(); message != nil; message = command.Next() {
 		var uid uint32
+		var literalSize int64
+		var digest string
+		var internalDate time.Time
+		literalFound := false
 		for item := message.Next(); item != nil; item = message.Next() {
 			switch item := item.(type) {
 			case imapclientv2.FetchItemDataUID:
 				uid = uint32(item.UID)
+			case imapclientv2.FetchItemDataInternalDate:
+				internalDate = item.Time
 			case imapclientv2.FetchItemDataBodySection:
 				if item.Literal == nil {
 					continue
 				}
-				candidate, ok := byUID[uid]
-				if !ok || uid == 0 {
+				if literalFound {
 					_, _ = io.Copy(io.Discard, item.Literal)
 					cleanup()
-					return nil, fmt.Errorf("fetch archived message returned unexpected UID %d", uid)
+					return nil, errors.New("fetch archived message returned duplicate literal")
 				}
-				if found[uid] {
-					_, _ = io.Copy(io.Discard, item.Literal)
-					cleanup()
-					return nil, fmt.Errorf("fetch archived message returned duplicate UID %d", uid)
-				}
-				literalSize := item.Literal.Size()
+				literalFound = true
+				literalSize = item.Literal.Size()
 				if messageExceedsArchiveLimit(literalSize, settings.maxMessageBytes) {
 					_, _ = io.Copy(io.Discard, item.Literal)
-					archived := &result[indexByUID[uid]]
-					archived.ContentState = domain.ArchiveContentOversized
-					archived.RawSize = literalSize
-					archived.OTP = ExtractOTP(candidate.parsed.subject, "", "")
-					found[uid] = true
 					continue
 				}
-				path, digest, writeErr := writeArchiveLiteral(settings.archiveTempDir, item.Literal, literalSize)
+				path, stagedDigest, writeErr := writeArchiveLiteral(settings.archiveTempDir, item.Literal, literalSize)
 				if writeErr != nil {
 					cleanup()
 					return nil, writeErr
 				}
-				staged[uid] = path
-				archived := &result[indexByUID[uid]]
-				archived.RawMIMEPath = path
-				archived.RawSize = literalSize
-				archived.RawSHA256 = digest
-				archived.ContentState = domain.ArchiveContentAvailable
-				found[uid] = true
+				pendingPath = path
+				// UID may follow BODY in a valid IMAP response.
+				digest = stagedDigest
 			}
 		}
-		if _, ok := byUID[uid]; !ok || uid == 0 {
+		candidate, ok := byUID[uid]
+		if !ok || uid == 0 || messageExceedsArchiveLimit(candidate.rawSize, settings.maxMessageBytes) {
 			cleanup()
 			return nil, fmt.Errorf("fetch archived message returned unexpected UID %d", uid)
 		}
+		if found[uid] || !literalFound {
+			cleanup()
+			return nil, fmt.Errorf("fetch archived message UID %d returned duplicate or missing literal", uid)
+		}
+		archived := &result[indexByUID[uid]]
+		archived.RawSize = literalSize
+		if !internalDate.IsZero() {
+			archived.InternalDate = internalDate
+		}
+		if pendingPath == "" {
+			archived.ContentState = domain.ArchiveContentOversized
+			archived.OTP = ExtractOTP(archived.Subject, "", "")
+		} else {
+			staged[uid] = pendingPath
+			archived.RawMIMEPath = pendingPath
+			archived.RawSHA256 = digest
+			archived.ContentState = domain.ArchiveContentAvailable
+			pendingPath = ""
+		}
+		found[uid] = true
 	}
 	if err := command.Close(); err != nil {
 		cleanup()
@@ -1043,8 +1060,7 @@ func fetchArchivedMessagesIndividually(
 	return result, nil
 }
 
-// fetchArchivedMessage remains as a small compatibility wrapper for callers
-// and tests that exercise one-message fetching directly.
+// fetchArchivedMessage handles the single-message compatibility fallback.
 func fetchArchivedMessage(
 	client *imapclientv2.Client,
 	candidate archiveCandidate,
