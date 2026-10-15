@@ -750,6 +750,39 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 		return domain.Alias{}, expireAutoSession(wrapError(CodeSessionExpired, ErrSessionExpired,
 			errors.New("stored Apple session omitted the account identifier")))
 	}
+	// Interactive and unscheduled callers must use the same pending scope as
+	// the channel they will actually select. An expired ACC candidate must not
+	// block an independent Web attempt; unknown provenance still gates both.
+	if repo, ok := s.repo.(channelPendingRepository); ok && hasPendingConfirmation {
+		selected := channel
+		if selected == "auto" {
+			selected = ""
+			if !probe {
+				selected = domain.ScheduledCreationChannel(ctx)
+			}
+			if selected == "" {
+				selected = "icloud_web"
+				if accountCreationSessionUsable(session.Account, s.now()) && !domain.WebOnlyCreation(ctx) {
+					selected = "apple_account"
+				}
+			}
+		}
+		pendingConfirmation, pendingErr = repo.GetPendingAutoAliasConfirmationForChannel(ctx, accountID, selected)
+		if pendingErr != nil && !errors.Is(pendingErr, store.ErrNotFound) {
+			return domain.Alias{}, pendingErr
+		}
+		hasPendingConfirmation = pendingErr == nil
+		pendingConfirmationTracked = hasPendingConfirmation
+		if !hasPendingConfirmation {
+			count, err := countEnabled(ctx, accountID)
+			if err != nil {
+				return domain.Alias{}, err
+			}
+			if count >= domain.MaxEnabledAliasesPerAccount {
+				return domain.Alias{}, store.ErrAliasLimit
+			}
+		}
+	}
 	// A fresh address consumes a creation slot before any Apple request. A
 	// pre-existing candidate follows the reconciliation path below without
 	// claiming another slot.
