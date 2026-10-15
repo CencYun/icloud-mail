@@ -118,7 +118,7 @@ func (s *Store) applyMailboxSync(ctx context.Context, accountID int64, expectedA
 	}
 	unlockArchive := s.lockMailArchiveAccount(accountID)
 	defer unlockArchive()
-	stagedArchive, err := s.stageArchiveMessages(result.ArchivedMessages)
+	stagedArchive, err := s.stageArchiveMessages(ctx, result.ArchivedMessages, true)
 	if err != nil {
 		return fmt.Errorf("stage mailbox archive: %w", err)
 	}
@@ -287,6 +287,7 @@ func (s *Store) applyMailboxSync(ctx context.Context, accountID int64, expectedA
 		return fmt.Errorf("commit mailbox sync: %w", err)
 	}
 	archiveCommitted = true
+	s.cleanupSupersededArchive(ctx, stagedArchive)
 	if err := s.EnforceMailArchiveLimit(ctx); err != nil {
 		return fmt.Errorf("enforce mailbox archive limit: %w", err)
 	}

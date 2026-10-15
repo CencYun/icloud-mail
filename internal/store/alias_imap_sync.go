@@ -108,7 +108,7 @@ func (s *Store) applyAliasMailboxSync(
 		}
 		result.ArchivedMessages = messages
 	}
-	stagedArchive, err := s.stageArchiveMessages(result.ArchivedMessages)
+	stagedArchive, err := s.stageArchiveMessages(ctx, result.ArchivedMessages, !webmail)
 	if err != nil {
 		return fmt.Errorf("stage alias mailbox archive: %w", err)
 	}
@@ -279,6 +279,7 @@ func (s *Store) applyAliasMailboxSync(
 		return fmt.Errorf("commit alias mailbox sync: %w", err)
 	}
 	archiveCommitted = true
+	s.cleanupSupersededArchive(ctx, stagedArchive)
 	if err := s.EnforceMailArchiveLimit(ctx); err != nil {
 		return fmt.Errorf("enforce alias mailbox archive limit: %w", err)
 	}

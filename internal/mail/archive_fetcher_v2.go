@@ -220,6 +220,7 @@ func (f *Fetcher) fetchArchiveIncremental(
 			}
 		}
 	}()
+	eligible := make([]archiveCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
 			return failure, err
@@ -227,15 +228,16 @@ func (f *Fetcher) fetchArchiveIncremental(
 		if settings.activeRecent && candidate.internalDate.Before(syncedAt.Add(-settings.activeRecentWindow)) {
 			continue
 		}
-		archived, err := fetchArchivedMessage(client, candidate, account.ID, mailbox.UIDValidity, syncedAt, settings)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return failure, ctxErr
-			}
-			return failure, err
-		}
-		result.ArchivedMessages = append(result.ArchivedMessages, archived)
+		eligible = append(eligible, candidate)
 	}
+	archived, err := fetchArchivedMessages(client, eligible, account.ID, mailbox.UIDValidity, syncedAt, settings)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return failure, ctxErr
+		}
+		return failure, err
+	}
+	result.ArchivedMessages = append(result.ArchivedMessages, archived...)
 	published, err := publish()
 	if err != nil {
 		return failure, err
@@ -843,6 +845,206 @@ func classifyArchiveRecipientAliases(
 	return classifyICloudRecipientAliases(header, aliases, account, allowWeak)
 }
 
+// fetchArchivedMessages downloads all eligible literals in one UID FETCH.
+// Apple IMAP round trips dominate synchronization latency; one command per
+// bounded batch keeps progress and rollback bounded while avoiding a separate
+// FETCH for every matching message.
+func fetchArchivedMessages(
+	client *imapclientv2.Client,
+	candidates []archiveCandidate,
+	accountID int64,
+	uidValidity uint32,
+	syncedAt time.Time,
+	settings fetchSettings,
+) ([]domain.ArchivedMessage, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if settings.archiveTempDir == "" {
+		return nil, errors.New("mail archive temporary directory is not configured")
+	}
+	if err := os.MkdirAll(settings.archiveTempDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create mail archive temporary directory: %w", err)
+	}
+	byUID := make(map[uint32]archiveCandidate, len(candidates))
+	indexByUID := make(map[uint32]int, len(candidates))
+	result := make([]domain.ArchivedMessage, 0, len(candidates))
+	set := imapv2.UIDSet{}
+	fetchCount := 0
+	for _, candidate := range candidates {
+		if candidate.uid == 0 {
+			return nil, errors.New("archive candidate has empty UID")
+		}
+		if _, duplicate := byUID[candidate.uid]; duplicate {
+			return nil, fmt.Errorf("archive candidates contain duplicate UID %d", candidate.uid)
+		}
+		byUID[candidate.uid] = candidate
+		archived := domain.ArchivedMessage{
+			AccountID:    accountID,
+			UIDValidity:  uidValidity,
+			UID:          candidate.uid,
+			MessageID:    candidate.parsed.messageID,
+			InternalDate: candidate.internalDate,
+			HeaderDate:   candidate.parsed.headerDate,
+			From:         candidate.parsed.from,
+			To:           candidate.parsed.to,
+			CC:           candidate.parsed.cc,
+			Subject:      candidate.parsed.subject,
+			RawSize:      candidate.rawSize,
+			UpstreamSeen: candidate.upstreamSeen,
+			AliasIDs:     append([]int64(nil), candidate.aliasIDs...),
+			SyncedAt:     syncedAt,
+		}
+		if messageExceedsArchiveLimit(candidate.rawSize, settings.maxMessageBytes) {
+			archived.ContentState = domain.ArchiveContentOversized
+			archived.OTP = ExtractOTP(archived.Subject, "", "")
+		} else {
+			set.AddNum(imapv2.UID(candidate.uid))
+			fetchCount++
+		}
+		indexByUID[candidate.uid] = len(result)
+		result = append(result, archived)
+	}
+	if fetchCount == 0 {
+		return result, nil
+	}
+
+	command := client.Fetch(set, &imapv2.FetchOptions{
+		UID:          true,
+		InternalDate: true,
+		RFC822Size:   true,
+		BodySection:  []*imapv2.FetchItemBodySection{{Peek: true}},
+	})
+	defer command.Close()
+	found := make(map[uint32]bool, fetchCount)
+	staged := make(map[uint32]string, fetchCount)
+	cleanup := func() {
+		for _, path := range staged {
+			_ = os.Remove(path)
+		}
+	}
+	for message := command.Next(); message != nil; message = command.Next() {
+		var uid uint32
+		for item := message.Next(); item != nil; item = message.Next() {
+			switch item := item.(type) {
+			case imapclientv2.FetchItemDataUID:
+				uid = uint32(item.UID)
+			case imapclientv2.FetchItemDataBodySection:
+				if item.Literal == nil {
+					continue
+				}
+				candidate, ok := byUID[uid]
+				if !ok || uid == 0 {
+					_, _ = io.Copy(io.Discard, item.Literal)
+					cleanup()
+					return nil, fmt.Errorf("fetch archived message returned unexpected UID %d", uid)
+				}
+				if found[uid] {
+					_, _ = io.Copy(io.Discard, item.Literal)
+					cleanup()
+					return nil, fmt.Errorf("fetch archived message returned duplicate UID %d", uid)
+				}
+				literalSize := item.Literal.Size()
+				if messageExceedsArchiveLimit(literalSize, settings.maxMessageBytes) {
+					_, _ = io.Copy(io.Discard, item.Literal)
+					archived := &result[indexByUID[uid]]
+					archived.ContentState = domain.ArchiveContentOversized
+					archived.RawSize = literalSize
+					archived.OTP = ExtractOTP(candidate.parsed.subject, "", "")
+					found[uid] = true
+					continue
+				}
+				path, digest, writeErr := writeArchiveLiteral(settings.archiveTempDir, item.Literal, literalSize)
+				if writeErr != nil {
+					cleanup()
+					return nil, writeErr
+				}
+				staged[uid] = path
+				archived := &result[indexByUID[uid]]
+				archived.RawMIMEPath = path
+				archived.RawSize = literalSize
+				archived.RawSHA256 = digest
+				archived.ContentState = domain.ArchiveContentAvailable
+				found[uid] = true
+			}
+		}
+		if _, ok := byUID[uid]; !ok || uid == 0 {
+			cleanup()
+			return nil, fmt.Errorf("fetch archived message returned unexpected UID %d", uid)
+		}
+	}
+	if err := command.Close(); err != nil {
+		cleanup()
+		if isUnsupportedBatchBodyFetch(err) {
+			return fetchArchivedMessagesIndividually(client, candidates, accountID, uidValidity, syncedAt, settings)
+		}
+		return nil, fmt.Errorf("fetch archived messages: %w", err)
+	}
+	for uid := range byUID {
+		if messageExceedsArchiveLimit(byUID[uid].rawSize, settings.maxMessageBytes) {
+			continue
+		}
+		if !found[uid] {
+			cleanup()
+			return nil, fmt.Errorf("fetch archived message UID %d returned no literal", uid)
+		}
+	}
+
+	limits := defaultMIMELimits(int64(settings.maxBodyBytes), int64(settings.maxParsedMessageBytes))
+	for uid, path := range staged {
+		file, err := os.Open(path)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("open staged MIME for parsing: %w", err)
+		}
+		parsed, parseErr := parseMIMEMessageReader(file, result[indexByUID[uid]].RawSize, limits)
+		closeErr := file.Close()
+		if parseErr != nil {
+			cleanup()
+			return nil, parseErr
+		}
+		if closeErr != nil {
+			cleanup()
+			return nil, closeErr
+		}
+		archived := &result[indexByUID[uid]]
+		projectParsedArchiveContent(archived, parsed)
+		archived.OTP = ExtractOTP(parsed.subject, parsed.textBody, parsed.htmlBody)
+	}
+	return result, nil
+}
+
+func isUnsupportedBatchBodyFetch(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "serverbug") || strings.Contains(message, "static uid")
+}
+
+func fetchArchivedMessagesIndividually(
+	client *imapclientv2.Client,
+	candidates []archiveCandidate,
+	accountID int64,
+	uidValidity uint32,
+	syncedAt time.Time,
+	settings fetchSettings,
+) ([]domain.ArchivedMessage, error) {
+	result := make([]domain.ArchivedMessage, 0, len(candidates))
+	for _, candidate := range candidates {
+		archived, err := fetchArchivedMessage(client, candidate, accountID, uidValidity, syncedAt, settings)
+		if err != nil {
+			for _, previous := range result {
+				if previous.RawMIMEPath != "" {
+					_ = os.Remove(previous.RawMIMEPath)
+				}
+			}
+			return nil, err
+		}
+		result = append(result, archived)
+	}
+	return result, nil
+}
+
+// fetchArchivedMessage remains as a small compatibility wrapper for callers
+// and tests that exercise one-message fetching directly.
 func fetchArchivedMessage(
 	client *imapclientv2.Client,
 	candidate archiveCandidate,
