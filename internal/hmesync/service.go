@@ -946,6 +946,21 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 		}
 		return saved, confirmErr
 	}
+	confirmAccountDetail := func(candidate apple.Alias, session apple.Session) (apple.Alias, apple.Session, error) {
+		reader, ok := s.client.(accountAliasReader)
+		if !ok || session.Account == nil || candidate.AnonymousID == "" || !candidate.IsActive {
+			return candidate, session, nil
+		}
+		confirmed, managed, readErr := reader.GetAccountAlias(ctx, *session.Account, candidate)
+		session.Account = &managed
+		if err := checkpointSession(ctx, session); err != nil {
+			return candidate, session, wrapPersistenceError(err)
+		}
+		if readErr != nil {
+			return candidate, session, mapAppleError(readErr, false)
+		}
+		return confirmed, session, nil
+	}
 	// ListAliases may rotate cookies even when the forwarding preflight rejects
 	// the operation. Preserve that valid checkpoint so a corrected setting does
 	// not force an otherwise unnecessary Apple login.
@@ -963,12 +978,14 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 			pendingCreatedAt = pendingConfirmation.Alias.CreatedAt
 		}
 		staleBefore := s.now().Add(-stalePendingAliasConfirmationAge)
-		if pendingCreatedAt.IsZero() || pendingCreatedAt.After(staleBefore) {
+		var resumeCause error
+		completionAcknowledged := false
+		{
 			// A generated address can survive a temporary failure while Apple is
 			// completing it. Resume that idempotent second step before treating
 			// the candidate as directory-propagation pending.
 			if completer, ok := s.client.(accountAliasCompleter); ok && listedSession.Account != nil &&
-				listedSession.Account.APIKey != "" && sameEmail(listedSession.Account.AppleID, record.AppleID) {
+				listedSession.Account.APIKey != "" && !listedSession.Account.RefreshRejected && sameEmail(listedSession.Account.AppleID, record.AppleID) {
 				resumed, managed, resumeErr := completer.CompleteAccountAlias(
 					ctx, *listedSession.Account, pendingConfirmation.Alias.Address, pendingConfirmation.Alias.Label, "",
 				)
@@ -976,6 +993,16 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 				if err := checkpointSession(ctx, listedSession); err != nil {
 					return domain.Alias{}, wrapPersistenceError(err)
 				}
+				completionAcknowledged = resumeErr == nil && resumed.AnonymousID != ""
+				if completionAcknowledged {
+					var detailErr error
+					resumed, listedSession, detailErr = confirmAccountDetail(resumed, listedSession)
+					if detailErr == nil && resumed.ForwardToEmail != "" {
+						return confirmPendingAlias(ctx, pendingConfirmation.Alias, resumed, listedSession, 2)
+					}
+					resumeErr = detailErr
+				}
+				resumeCause = resumeErr
 				if strings.TrimSpace(resumed.HME) != "" {
 					resumedSettings, resumedSession, listErr := s.client.ListAliases(ctx, listedSession)
 					if hasAppleSessionState(resumedSession) {
@@ -994,10 +1021,12 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 					return domain.Alias{}, mapAppleError(resumeErr, false)
 				}
 			}
+		}
+		if resumeCause != nil || completionAcknowledged || pendingCreatedAt.IsZero() || pendingCreatedAt.After(staleBefore) {
 			return domain.Alias{}, wrapError(
 				CodeAliasConfirmationPending,
 				ErrAliasConfirmationPending,
-				errors.New("Apple list omitted the pending reserved alias"),
+				errors.Join(errors.New("Apple list omitted the pending reserved alias"), resumeCause),
 			)
 		}
 		discarder, ok := s.repo.(StalePendingAutoAliasRepository)
@@ -1252,6 +1281,9 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 	}
 	if mappedCreateErr != nil && errors.Is(mappedCreateErr, ErrSessionExpired) {
 		return domain.Alias{}, expireAutoSession(mappedCreateErr)
+	}
+	if mappedCreateErr == nil && created.Origin == "APPLE_ACCOUNT" && created.ForwardToEmail == "" {
+		created, sessionForConfirmation, mappedCreateErr = confirmAccountDetail(created, sessionForConfirmation)
 	}
 
 	// A complete, internally consistent reserve response can publish the staged
