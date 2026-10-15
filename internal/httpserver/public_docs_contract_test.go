@@ -19,12 +19,13 @@ func TestPublicDocsCoversCurrentPickupPoolAndRetirement(t *testing.T) {
 	}
 	body := response.Body.String()
 	for _, contract := range []string{
-		"2026-10-14-creation-fallback", "ICLOUD_API_OTP_RETURN_LATEST_ONLY", "/api/v1/pool/claim",
+		"2026-10-16-mail-archive-upgrade", "v0.2.5", "ICLOUD_API_OTP_RETURN_LATEST_ONLY", "/api/v1/pool/claim",
 		"/leases/LEASE_ID/commit", "wait_seconds=15", "LEASE_CLOSED", "root+tag",
 		"/aliases/batch/jobs/OPERATION_ID/reconcile", "X-CSRF-Token", "IDEMPOTENCY_CONFLICT",
 		"resume=false", "APPLE_DELETE_UNCERTAIN", "retiring", "retired", "IMAP 网络读取可并行",
 		"被拦截刷新不扣额度、不重置恢复时间", "X-Retry-After-Ms", "/oauth2/v2.0/token",
 		"自动创建与通道恢复", "旧通道每小时最多 5 次", "自动恢复 19＋4", "历史关闭项不会在升级时批量重开",
+		"默认每批最多处理 32 条 UID", "保留归档身份与取码记录", "手动与批量创建按实际使用的通道确认原候选",
 	} {
 		if !strings.Contains(body, contract) {
 			t.Errorf("public docs missing contract %q", contract)
