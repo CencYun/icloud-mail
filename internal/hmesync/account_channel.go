@@ -387,6 +387,14 @@ func (s *Service) createRemoteAliasWithMode(ctx context.Context, id int64, web a
 		}
 	}
 	for _, selected := range channels {
+		if repo, ok := s.repo.(channelPendingRepository); ok {
+			if _, err := repo.GetPendingAutoAliasConfirmationForChannel(ctx, id, selected); err == nil {
+				rememberWait(s.now().Add(domain.AppleCreationMinInterval), wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, nil))
+				continue
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return apple.Alias{}, web, err
+			}
+		}
 		until := cooldowns[selected]
 		if !probe && s.now().Before(until) {
 			rememberWait(until, &apple.Error{Op: "creation channel cooling down", Kind: apple.ErrService, StatusCode: http.StatusTooManyRequests, RetryAfter: until.Sub(s.now())})
@@ -441,6 +449,16 @@ func (s *Service) createRemoteAliasWithMode(ctx context.Context, id int64, web a
 		}
 		if strings.TrimSpace(alias.HME) != "" && strings.TrimSpace(alias.Label) == "" {
 			alias.Label = label
+		}
+		if strings.TrimSpace(alias.HME) != "" {
+			if selected == "apple_account" {
+				alias.Origin = "APPLE_ACCOUNT"
+			} else {
+				alias.Origin = "ICLOUD_WEB"
+			}
+			if !probe && apple.IsRateLimited(err) {
+				err = s.scopeCreationThrottle(ctx, id, selected, err)
+			}
 		}
 		if probe || err == nil || strings.TrimSpace(alias.HME) != "" || !apple.IsRateLimited(err) {
 			return alias, web, err

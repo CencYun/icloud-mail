@@ -623,6 +623,13 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 	} else {
 		return domain.Alias{}, errors.New("automatic alias creation persistence is unavailable")
 	}
+	if preferred := domain.ScheduledCreationChannel(ctx); !probe && channel == "auto" && preferred != "" {
+		if repo, ok := s.repo.(channelPendingRepository); ok {
+			getPending = func(ctx context.Context, id int64) (domain.PendingAliasAPIKey, error) {
+				return repo.GetPendingAutoAliasConfirmationForChannel(ctx, id, preferred)
+			}
+		}
+	}
 	autoClient, ok := s.client.(AutoAliasClient)
 	if !ok {
 		return domain.Alias{}, errors.New("automatic alias creation client is unavailable")
@@ -953,8 +960,11 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 		}
 		confirmed, managed, readErr := reader.GetAccountAlias(ctx, *session.Account, candidate)
 		session.Account = &managed
+		if !probe {
+			readErr = s.scopeCreationThrottle(ctx, accountID, "apple_account", readErr)
+		}
 		if err := checkpointSession(ctx, session); err != nil {
-			return candidate, session, wrapPersistenceError(err)
+			return candidate, session, errors.Join(wrapPersistenceError(err), readErr)
 		}
 		if readErr != nil {
 			return candidate, session, mapAppleError(readErr, false)
@@ -980,21 +990,61 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 		staleBefore := s.now().Add(-stalePendingAliasConfirmationAge)
 		var resumeCause error
 		completionAcknowledged := false
+		if pendingConfirmation.CreationChannel == "apple_account" && pendingConfirmation.CreationRemoteID != "" {
+			if !probe {
+				until, err := s.creationChannelPausedUntil(ctx, accountID, "apple_account")
+				if err != nil {
+					return domain.Alias{}, wrapPersistenceError(err)
+				}
+				if until.After(s.now()) {
+					return domain.Alias{}, creationCooldownError(until, s.now())
+				}
+			}
+			candidate := apple.Alias{HME: pendingConfirmation.Address, AnonymousID: pendingConfirmation.CreationRemoteID}
+			confirmed, returned, detailErr := confirmAccountDetail(candidate, listedSession)
+			if detailErr == nil && confirmed.ForwardToEmail != "" {
+				return confirmPendingAlias(ctx, pendingConfirmation.Alias, confirmed, returned, 2)
+			}
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, detailErr)
+		}
 		{
 			// A generated address can survive a temporary failure while Apple is
 			// completing it. Resume that idempotent second step before treating
 			// the candidate as directory-propagation pending.
-			if completer, ok := s.client.(accountAliasCompleter); ok && listedSession.Account != nil &&
+			if completer, ok := s.client.(accountAliasCompleter); ok && pendingConfirmation.CreationChannel != "icloud_web" && listedSession.Account != nil &&
 				listedSession.Account.APIKey != "" && !listedSession.Account.RefreshRejected && sameEmail(listedSession.Account.AppleID, record.AppleID) {
+				if !probe {
+					until, err := s.creationChannelPausedUntil(ctx, accountID, "apple_account")
+					if err != nil {
+						return domain.Alias{}, wrapPersistenceError(err)
+					}
+					if until.After(s.now()) {
+						return domain.Alias{}, creationCooldownError(until, s.now())
+					}
+				}
 				resumed, managed, resumeErr := completer.CompleteAccountAlias(
 					ctx, *listedSession.Account, pendingConfirmation.Alias.Address, pendingConfirmation.Alias.Label, "",
 				)
 				listedSession.Account = &managed
+				if !probe {
+					resumeErr = s.scopeCreationThrottle(ctx, accountID, "apple_account", resumeErr)
+				}
 				if err := checkpointSession(ctx, listedSession); err != nil {
-					return domain.Alias{}, wrapPersistenceError(err)
+					return domain.Alias{}, errors.Join(wrapPersistenceError(err), resumeErr)
 				}
 				completionAcknowledged = resumeErr == nil && resumed.AnonymousID != ""
 				if completionAcknowledged {
+					if !sameEmail(resumed.HME, pendingConfirmation.Address) {
+						return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, errors.New("completed candidate address mismatch"))
+					}
+					if repo, ok := s.repo.(candidateDetailRepository); ok {
+						persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
+						err := repo.SaveAliasCreationCandidateDetail(persistCtx, accountID, pendingConfirmation.ID, "apple_account", resumed.AnonymousID)
+						cancel()
+						if err != nil {
+							return domain.Alias{}, wrapPersistenceError(err)
+						}
+					}
 					var detailErr error
 					resumed, listedSession, detailErr = confirmAccountDetail(resumed, listedSession)
 					if detailErr == nil && resumed.ForwardToEmail != "" {
@@ -1022,7 +1072,7 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 				}
 			}
 		}
-		if resumeCause != nil || completionAcknowledged || pendingCreatedAt.IsZero() || pendingCreatedAt.After(staleBefore) {
+		if resumeCause != nil || completionAcknowledged || pendingConfirmation.CreationChannel != "" || pendingCreatedAt.IsZero() || pendingCreatedAt.After(staleBefore) {
 			return domain.Alias{}, wrapError(
 				CodeAliasConfirmationPending,
 				ErrAliasConfirmationPending,
@@ -1241,15 +1291,22 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 	reportProgress(domain.AliasCreationPhaseSavingCandidate, autoCreateSavingCandidatePercent, 0)
 	persistContext, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
 	provisional, persistErr := publishAlias(persistContext, sessionRecord, domain.Alias{
-		AccountID:      accountID,
-		AccountEmail:   account.Email,
-		Address:        address,
-		Label:          label,
-		APIKeyHash:     hash,
-		APIKeyPrefix:   prefix,
-		Enabled:        false,
-		LastSyncStatus: domain.SyncStatusPending,
-		LastSyncError:  domain.AppleAliasConfirmationPending,
+		CreationChannel: func() string {
+			if created.Origin == "APPLE_ACCOUNT" {
+				return "apple_account"
+			}
+			return "icloud_web"
+		}(),
+		CreationRemoteID: created.AnonymousID,
+		AccountID:        accountID,
+		AccountEmail:     account.Email,
+		Address:          address,
+		Label:            label,
+		APIKeyHash:       hash,
+		APIKeyPrefix:     prefix,
+		Enabled:          false,
+		LastSyncStatus:   domain.SyncStatusPending,
+		LastSyncError:    domain.AppleAliasConfirmationPending,
 	}, apiKeyCiphertext)
 	cancelPersist()
 	if persistErr != nil {
@@ -1321,6 +1378,11 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 		requiresAccountAction := false
 		if listErr != nil {
 			confirmationErr = mapAppleError(listErr, false)
+			if apple.IsRateLimited(listErr) {
+				// The shared directory is required by both channels. Its throttle
+				// takes precedence over an earlier channel-scoped detail failure.
+				return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, confirmationErr)
+			}
 			if errors.Is(confirmationErr, ErrSessionExpired) {
 				expiredErr := expireAutoSession(confirmationErr)
 				if confirmationCause != nil {

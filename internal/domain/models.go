@@ -112,9 +112,12 @@ type PendingAliasAPIKey struct {
 }
 
 type Alias struct {
-	ID           int64
-	AccountID    int64
-	AccountEmail string
+	// Internal creation provenance; persisted with pending candidates, never credentials.
+	CreationChannel  string `json:"-"`
+	CreationRemoteID string `json:"-"`
+	ID               int64
+	AccountID        int64
+	AccountEmail     string
 	// AccountDisabled is a read-time parent gate; Enabled keeps the alias's
 	// own setting so re-enabling the parent does not revive manually paused aliases.
 	AccountDisabled bool
