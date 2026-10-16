@@ -50,6 +50,11 @@ type adminAPIAppleSessionDTO struct {
 	Region          string  `json:"region"`
 	AuthenticatedAt *string `json:"authenticated_at"`
 	ExpiresAt       *string `json:"expires_at"`
+	Health          string  `json:"health,omitempty"`
+	LastRefreshedAt *string `json:"last_refreshed_at,omitempty"`
+	NextRefreshAt   *string `json:"next_refresh_at,omitempty"`
+	NextRetryAt     *string `json:"next_retry_at,omitempty"`
+	RefreshFailures int     `json:"refresh_failures,omitempty"`
 }
 
 type adminAPIAppleAuthResultDTO struct {
@@ -278,6 +283,11 @@ func adminAPIAppleSessionFromInfo(info hmesync.SessionInfo) *adminAPIAppleSessio
 		Region:          info.Region,
 		AuthenticatedAt: adminAPIOptionalTime(info.AuthenticatedAt),
 		ExpiresAt:       adminAPIOptionalTime(info.ExpiresAt),
+		Health:          info.Health,
+		LastRefreshedAt: adminAPIOptionalTime(info.LastRefreshedAt),
+		NextRefreshAt:   adminAPIOptionalTime(info.NextRefreshAt),
+		NextRetryAt:     adminAPIOptionalTime(info.NextRetryAt),
+		RefreshFailures: info.RefreshFailures,
 	}
 }
 

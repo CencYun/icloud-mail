@@ -66,15 +66,37 @@ func newChallengeID() (string, error) {
 
 func accountSessionInfo(session *apple.AccountSession) SessionInfo {
 	if session == nil || session.APIKey == "" || session.AuthenticatedAt.IsZero() {
-		return SessionInfo{Status: StatusLoginRequired}
+		return SessionInfo{Status: StatusLoginRequired, Health: "login_required"}
 	}
-	return SessionInfo{Status: StatusAuthenticated, AppleID: session.AppleID, Region: publicRegion(string(session.Region)), AuthenticatedAt: &session.AuthenticatedAt, ExpiresAt: &session.ExpiresAt}
+	info := SessionInfo{
+		Status: StatusAuthenticated, AppleID: session.AppleID, Region: publicRegion(string(session.Region)),
+		AuthenticatedAt: &session.AuthenticatedAt, ExpiresAt: &session.ExpiresAt,
+		Health: "healthy", RefreshFailures: session.RefreshFailures,
+	}
+	if !session.RefreshedAt.IsZero() {
+		info.LastRefreshedAt = &session.RefreshedAt
+	}
+	if session.RefreshRejected {
+		info.Health = "login_required"
+	} else {
+		next := session.NextRefreshAt()
+		if !next.IsZero() {
+			info.NextRefreshAt = &next
+		}
+		if session.RefreshFailures > 0 {
+			info.Health = "retry_wait"
+			if !session.RefreshAfter.IsZero() {
+				info.NextRetryAt = &session.RefreshAfter
+			}
+		}
+	}
+	return info
 }
 
 func (s *Service) GetAccountSession(ctx context.Context, id int64) (SessionInfo, error) {
 	session, err := s.readAccountManagementSession(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
-		return SessionInfo{Status: StatusLoginRequired}, nil
+		return SessionInfo{Status: StatusLoginRequired, Health: "login_required"}, nil
 	}
 	if err != nil {
 		return SessionInfo{}, err
@@ -82,6 +104,9 @@ func (s *Service) GetAccountSession(ctx context.Context, id int64) (SessionInfo,
 	info := accountSessionInfo(session)
 	if session.RefreshRejected || info.ExpiresAt != nil && !info.ExpiresAt.IsZero() && !info.ExpiresAt.After(s.now()) {
 		info.Status = StatusExpired
+		if info.Health != "retry_wait" {
+			info.Health = "login_required"
+		}
 	}
 	return info, nil
 }

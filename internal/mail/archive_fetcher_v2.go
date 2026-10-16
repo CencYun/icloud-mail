@@ -101,22 +101,31 @@ func (f *Fetcher) fetchArchiveIncremental(
 		Reset:     reset,
 		TargetUID: upperUID,
 	}
-	// Bound cold recovery, but never rewind a live cursor or skip its pending
-	// batches. Notifications and ordinary reads then fetch each new UID once.
-	if settings.activeRecent && (reset || syncedAt.Sub(previous.UpdatedAt) > settings.activeRecentWindow) {
-		boundary, hasMore, err := establishArchiveRecentCursor(ctx, client, mailbox.NumMessages, upperUID, settings.activeRecentCandidates)
+	windowSince := syncedAt.Add(-settings.activeRecentWindow)
+	pendingWindow := !reset && !previous.ActiveWindowSince.IsZero()
+	if pendingWindow {
+		windowSince = previous.ActiveWindowSince
+	}
+	// Recover by time, not by a fixed count of messages. Keep a pending window
+	// pinned until all of its batches commit, even after sleep or restart.
+	if settings.activeRecent && !pendingWindow && (reset || syncedAt.Sub(previous.UpdatedAt) > settings.activeRecentWindow) {
+		lastUID := uint32(0)
+		if !reset {
+			lastUID = previous.LastUID
+		}
+		boundary, err := establishActiveArchiveCursor(ctx, client, lastUID, upperUID, windowSince)
 		if err != nil {
 			return failure, fmt.Errorf("establish active recent cursor: %w", err)
 		}
-		if !reset && previous.LastUID > boundary {
-			boundary = previous.LastUID
-		}
-		result.State.LastUID, result.HasMore = boundary, hasMore
+		result.State.LastUID, result.HasMore = boundary, boundary < upperUID
 		result.RecoveryBoundaryUID = boundary
 		baseline := result.State
 		previous = &baseline
 	}
 	publish := func() (domain.MailboxSyncResult, error) {
+		if (settings.activeRecent || pendingWindow) && result.HasMore {
+			result.State.ActiveWindowSince = windowSince
+		}
 		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseValidating, 25)
 		updates, err := reconcileLegacySnapshotPositions(
 			ctx, client, snapshotPositions, mailbox.UIDValidity,
@@ -225,7 +234,7 @@ func (f *Fetcher) fetchArchiveIncremental(
 		if err := ctx.Err(); err != nil {
 			return failure, err
 		}
-		if settings.activeRecent && candidate.internalDate.Before(syncedAt.Add(-settings.activeRecentWindow)) {
+		if (settings.activeRecent || pendingWindow) && candidate.internalDate.Before(windowSince) {
 			continue
 		}
 		eligible = append(eligible, candidate)
@@ -631,6 +640,72 @@ func fetchArchiveSequenceRange(client *imapclientv2.Client, first, last uint32, 
 		}
 	}
 	return messages, nil
+}
+
+// SINCE is a server-side date filter, not a timestamp comparison. Widen by
+// one day for INTERNALDATE timezones; candidate headers enforce the exact
+// timestamp before any body is read. ESEARCH keeps the response constant-size
+// where supported; rev1 peers return only the date-filtered UID metadata.
+func establishActiveArchiveCursor(ctx context.Context, client *imapclientv2.Client, lastUID, upperUID uint32, since time.Time) (uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return lastUID, err
+	}
+	if lastUID > upperUID {
+		return lastUID, errors.New("active archive cursor exceeds mailbox upper UID")
+	}
+	if lastUID == upperUID {
+		return upperUID, nil
+	}
+	set := imapv2.UIDSet{}
+	set.AddRange(imapv2.UID(lastUID+1), imapv2.UID(upperUID))
+	criteria := &imapv2.SearchCriteria{UID: []imapv2.UIDSet{set}, Since: since.UTC().AddDate(0, 0, -1)}
+	var options *imapv2.SearchOptions
+	if client.Caps().Has(imapv2.CapESearch) {
+		options = &imapv2.SearchOptions{ReturnMin: true, ReturnCount: true}
+	}
+	data, err := client.UIDSearch(criteria, options).Wait()
+	if err != nil {
+		return lastUID, err
+	}
+	if err := ctx.Err(); err != nil {
+		return lastUID, err
+	}
+	if data == nil {
+		return lastUID, errors.New("active archive search returned no response")
+	}
+	var first uint32
+	if options != nil {
+		first = data.Min
+		if (first == 0) != (data.Count == 0) {
+			return lastUID, errors.New("active archive search returned inconsistent minimum and count")
+		}
+		if uint64(data.Count) > uint64(upperUID)-uint64(lastUID) {
+			return lastUID, errors.New("active archive search returned an out-of-range count")
+		}
+	} else {
+		// Read the compact ranges directly rather than expanding a busy day's
+		// SEARCH result into an additional allocation per matching message.
+		set, ok := data.All.(imapv2.UIDSet)
+		if !ok || set.Dynamic() {
+			return lastUID, errors.New("active archive search returned an invalid UID set")
+		}
+		for _, span := range set {
+			lo, hi := min(uint32(span.Start), uint32(span.Stop)), max(uint32(span.Start), uint32(span.Stop))
+			if lo <= lastUID || hi > upperUID {
+				return lastUID, errors.New("active archive search returned an out-of-range UID")
+			}
+			if first == 0 || lo < first {
+				first = lo
+			}
+		}
+	}
+	if first == 0 {
+		return upperUID, nil
+	}
+	if first <= lastUID || first > upperUID {
+		return lastUID, errors.New("active archive search returned an out-of-range UID")
+	}
+	return first - 1, nil
 }
 
 // establishArchiveRecentCursor returns the UID immediately before a bounded

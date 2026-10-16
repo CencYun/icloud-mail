@@ -325,36 +325,11 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 	if err != nil {
 		return SyncResult{}, err
 	}
-	record, session, err := s.loadSession(ctx, accountID)
+	directory, err := s.readSyncDirectory(ctx, account)
 	if err != nil {
-		if errors.Is(err, ErrSessionExpired) {
-			s.expireSession(ctx, accountID)
-		}
 		return SyncResult{}, err
 	}
-	validated, err := s.client.Validate(ctx, session)
-	if err != nil {
-		mapped := mapAppleError(err, false)
-		if errors.Is(mapped, ErrSessionExpired) {
-			s.expireSession(ctx, accountID)
-		}
-		return SyncResult{}, mapped
-	}
-	normalizeSession(&validated, record.AppleID, session.Region, s.now())
-	list, updated, err := s.client.ListAliases(ctx, validated)
-	if err != nil {
-		mapped := mapAppleError(err, false)
-		if errors.Is(err, apple.ErrHMEAuthentication) {
-			if checkpointErr := s.preserveValidatedDirectorySession(ctx, account, record, session, validated, false); checkpointErr != nil {
-				return SyncResult{}, errors.Join(wrapPersistenceError(checkpointErr), mapped)
-			}
-		}
-		if errors.Is(mapped, ErrSessionExpired) {
-			s.expireSession(ctx, accountID)
-		}
-		return SyncResult{}, mapped
-	}
-	normalizeSession(&updated, record.AppleID, validated.Region, s.now())
+	list, updated := directory.list, directory.web
 
 	filtered, inactive, err := filterAliases(list, account.Email)
 	if err != nil {
@@ -381,6 +356,7 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 	var imported domain.AliasImportResult
 	var issued []domain.AliasImportCredential
 	var saved domain.AppleWebSession
+	var webInfo SessionInfo
 	err = s.locker.WithAccountLock(ctx, accountID, func() error {
 		current, err := s.repo.GetAccount(ctx, accountID)
 		if err != nil {
@@ -389,7 +365,12 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		if !sameIdentity(identityOf(current), identityOf(account)) {
 			return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		}
-		saved, err = s.saveSession(ctx, accountID, updated)
+		if directory.fromAccount {
+			webInfo, err = s.GetSession(ctx, accountID)
+		} else {
+			saved, err = s.saveSession(ctx, accountID, updated)
+			webInfo = sessionInfoFromRecord(saved, updated, StatusAuthenticated)
+		}
 		if err != nil {
 			return err
 		}
@@ -438,7 +419,7 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 			FilteredOutCount:      len(list.Aliases) - len(filtered),
 		},
 		Created: created,
-		Session: sessionInfoFromRecord(saved, updated, StatusAuthenticated),
+		Session: webInfo,
 	}, nil
 }
 

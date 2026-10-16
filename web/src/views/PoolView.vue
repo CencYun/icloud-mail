@@ -6,7 +6,7 @@
         description="集中管理库存、项目接入和邮箱领取。"
       >
         <template #actions
-          ><el-button :loading="loading" @click="refresh"
+          ><el-button :loading="loading" @click="refresh(true)"
             >刷新</el-button
           ></template
         >
@@ -17,7 +17,7 @@
         closable
         @close="error = null"
       />
-      <el-tabs v-model="tab" @tab-change="refresh">
+      <el-tabs v-model="tab" @tab-change="refreshTab">
         <el-tab-pane label="邮箱库存" name="members">
           <div class="pool-toolbar">
             <el-select
@@ -56,9 +56,10 @@
               >加入已有邮箱</el-button
             >
           </div>
-          <el-table
+          <div class="pool-table-scroll" role="region" aria-label="邮箱库存列表" tabindex="0"><el-table
             :data="members.items"
             v-loading="loading"
+            class="pool-table"
             empty-text="暂无库存。添加主号后，可加入已有邮箱或开启新邮箱自动入池。"
           >
             <el-table-column prop="address" label="邮箱" min-width="245" />
@@ -95,7 +96,7 @@
                 >
               </template></el-table-column
             >
-          </el-table>
+          ></el-table></div>
           <el-pagination
             v-model:current-page="memberPage"
             :page-size="50"
@@ -136,9 +137,10 @@
                 :value="c.id"
             /></el-select>
           </div>
-          <el-table
+          <div class="pool-table-scroll" role="region" aria-label="领取记录列表" tabindex="0"><el-table
             :data="leases.items"
             v-loading="loading"
+            class="pool-table"
             empty-text="项目通过 API 领取邮箱后，记录会显示在这里。"
           >
             <el-table-column prop="address" label="邮箱" min-width="230" />
@@ -192,7 +194,7 @@
                 >
               </template></el-table-column
             >
-          </el-table>
+          ></el-table></div>
           <el-pagination
             v-model:current-page="leasePage"
             :page-size="50"
@@ -216,8 +218,10 @@
             每个项目使用独立 Key 领取邮箱，只能读取自己的领取记录。项目 Key
             仅在创建或轮换时展示。
           </p>
-          <el-table
+          <div class="pool-table-scroll" role="region" aria-label="项目 API Key 列表" tabindex="0"><el-table
             :data="clients"
+            v-loading="loading || clientsLoading"
+            class="pool-table"
             empty-text="创建第一个项目，将 Key 配置到调用程序。"
           >
             <el-table-column prop="project" label="项目" min-width="150" />
@@ -249,7 +253,7 @@
                 ></template
               ></el-table-column
             >
-          </el-table>
+          ></el-table></div>
           <p class="pool-hint">
             停用项目会停止其邮箱池 API
             访问。已发放的单邮箱凭据可在「隐私邮箱」中单独轮换或停用。
@@ -496,6 +500,9 @@ const members = ref({ items: [], total: 0 }),
   leases = ref({ items: [], total: 0 }),
   clients = ref([]),
   accounts = ref([]);
+const clientsLoaded = ref(false);
+const clientsLoading = ref(false);
+let clientsInFlight;
 const memberState = ref(""),
   leaseState = ref(""),
   search = ref(""),
@@ -625,7 +632,7 @@ async function loadLeases(signal) {
     if (ticket === leaseReadTicket) leases.value = result;
   });
 }
-async function refresh() {
+async function refresh(forceClients = false) {
   const ticket = ++poolRefreshTicket;
   poolRefreshController?.abort();
   const controller = new AbortController();
@@ -635,9 +642,14 @@ async function refresh() {
   error.value = null;
   try {
     await Promise.all([
-      request("/pool/clients", "GET", undefined, controller.signal).then((result) => {
-        if (ticket === poolRefreshTicket) clients.value = result;
-      }),
+      (forceClients || !clientsLoaded.value
+        ? loadClients(forceClients).then((result) => {
+            if (ticket === poolRefreshTicket) {
+              clients.value = result;
+              clientsLoaded.value = true;
+            }
+          })
+        : Promise.resolve()),
       activeTab === "members" ? loadMembers(controller.signal) :
         activeTab === "leases" ? loadLeases(controller.signal) :
           activeTab === "accounts" ? request("/pool/accounts", "GET", undefined, controller.signal).then((result) => {
@@ -649,6 +661,21 @@ async function refresh() {
   } finally {
     if (ticket === poolRefreshTicket) loading.value = false;
   }
+}
+function loadClients(force = false) {
+  if (clientsInFlight && !force) return clientsInFlight;
+  clientsLoading.value = true;
+  const promise = request("/pool/clients", "GET").finally(() => {
+    if (clientsInFlight === promise) {
+      clientsInFlight = undefined;
+      clientsLoading.value = false;
+    }
+  });
+  clientsInFlight = promise;
+  return promise;
+}
+function refreshTab() {
+  return refresh(false);
 }
 onBeforeUnmount(() => {
   ++poolRefreshTicket;
@@ -662,7 +689,7 @@ async function mutate(fn) {
   error.value = null;
   try {
     await fn();
-    await refresh();
+    await refresh(true);
   } catch (e) {
     if (e !== "cancel" && e !== "close") error.value = e;
   } finally {
@@ -881,7 +908,7 @@ async function enroll() {
       }, current);
     if (current()) {
       enrollOpen.value = false;
-      await refresh();
+      await refresh(true);
     }
   } catch (e) {
     if (current()) error.value = e;
@@ -917,12 +944,21 @@ const codeExample = computed(
   () =>
     `curl '${location.origin}/api/v1/pool/leases/LEASE_ID/code' \\\n  -H 'Authorization: Bearer PROJECT_KEY'`,
 );
-onMounted(refresh);
+onMounted(() => refresh(true));
 </script>
 
 <style scoped>
 .pool-page {
   min-width: 0;
+}
+.pool-table-scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.pool-table-scroll .pool-table {
+  min-width: 760px;
 }
 .pool-toolbar {
   display: flex;

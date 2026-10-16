@@ -25,7 +25,7 @@ func (s *Store) migrateAliasIMAPSync(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("migrate alias IMAP sync states: %w", err)
 	}
-	return nil
+	return s.migrateActiveIMAPWindow(ctx, tx)
 }
 
 // GetAliasIMAPSyncState reads the independent cursor used by targeted fetches.

@@ -354,6 +354,9 @@ type IMAPSyncState struct {
 	UIDValidity uint32
 	LastUID     uint32
 	UpdatedAt   time.Time
+	// ActiveWindowSince pins the body cutoff across pending shared-receive
+	// batches, including service restarts. Zero means no pending window.
+	ActiveWindowSince time.Time
 }
 
 // SeenTask is a durable request to mark one message as seen in its account's

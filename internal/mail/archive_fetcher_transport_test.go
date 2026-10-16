@@ -263,7 +263,7 @@ type archiveIMAPFixture struct {
 	searchPolicy  func(*imap.SearchCriteria) error
 }
 
-func startArchiveIMAPFixture(t *testing.T, messageCount int, blockUID imap.UID) *archiveIMAPFixture {
+func startArchiveIMAPFixture(t *testing.T, messageCount int, blockUID imap.UID, caps ...imap.CapSet) *archiveIMAPFixture {
 	t.Helper()
 	fixture := &archiveIMAPFixture{
 		account:  domain.Account{ID: 17, MailboxType: domain.MailboxTypeCustom, Email: "primary@example.test", IMAPHost: "127.0.0.1", IMAPUsername: "primary@example.test", Enabled: true},
@@ -295,12 +295,16 @@ func startArchiveIMAPFixture(t *testing.T, messageCount int, blockUID imap.UID) 
 		t.Fatal(err)
 	}
 	fixture.account.IMAPPort = listener.Addr().(*net.TCPAddr).Port
-	server := imapserver.New(&imapserver.Options{
+	options := &imapserver.Options{
 		Logger: log.New(io.Discard, "", 0),
 		NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return &archiveIMAPSession{Session: backend.NewSession(), fixture: fixture}, nil, nil
 		},
-	})
+	}
+	if len(caps) > 0 {
+		options.Caps = caps[0]
+	}
+	server := imapserver.New(options)
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Serve(listener) }()
 	t.Cleanup(func() {

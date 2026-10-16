@@ -11,6 +11,19 @@ import (
 	"icloud-api/internal/domain"
 )
 
+func (s *Store) migrateActiveIMAPWindow(ctx context.Context, tx *sql.Tx) error {
+	_, err := s.txExecContext(ctx, tx, `
+		CREATE TABLE IF NOT EXISTS imap_active_windows (
+			account_id BIGINT PRIMARY KEY REFERENCES imap_sync_states(account_id) ON DELETE CASCADE,
+			uid_validity BIGINT NOT NULL,
+			since_at BIGINT NOT NULL CHECK(since_at > 0)
+		)`)
+	if err != nil {
+		return fmt.Errorf("migrate active IMAP windows: %w", err)
+	}
+	return nil
+}
+
 // GetIMAPSyncState returns the last atomically committed mailbox cursor for an
 // account.
 func (s *Store) GetIMAPSyncState(ctx context.Context, accountID int64) (domain.IMAPSyncState, error) {
@@ -20,12 +33,15 @@ func (s *Store) GetIMAPSyncState(ctx context.Context, accountID int64) (domain.I
 
 	var state domain.IMAPSyncState
 	var uidValidity, lastUID int64
-	var updatedAt int64
+	var updatedAt, windowSince int64
 	err := s.queryRowContext(ctx, `
-		SELECT account_id, uid_validity, last_uid, updated_at
-		FROM imap_sync_states
-		WHERE account_id = ?`, accountID,
-	).Scan(&state.AccountID, &uidValidity, &lastUID, &updatedAt)
+		SELECT state.account_id, state.uid_validity, state.last_uid, state.updated_at,
+		       COALESCE(active_window.since_at, 0)
+		FROM imap_sync_states state
+		LEFT JOIN imap_active_windows active_window ON active_window.account_id = state.account_id
+		    AND active_window.uid_validity = state.uid_validity
+		WHERE state.account_id = ?`, accountID,
+	).Scan(&state.AccountID, &uidValidity, &lastUID, &updatedAt, &windowSince)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return domain.IMAPSyncState{}, ErrNotFound
@@ -41,6 +57,9 @@ func (s *Store) GetIMAPSyncState(ctx context.Context, accountID int64) (domain.I
 	state.UIDValidity = uint32(uidValidity)
 	state.LastUID = uint32(lastUID)
 	state.UpdatedAt = timeFromTimestamp(updatedAt)
+	if windowSince != 0 {
+		state.ActiveWindowSince = timeFromTimestamp(windowSince)
+	}
 	return state, nil
 }
 
@@ -247,6 +266,19 @@ func (s *Store) applyMailboxSync(ctx context.Context, accountID int64, expectedA
 		accountID, int64(result.State.UIDValidity), int64(result.State.LastUID), timestamp(observedAt),
 	); err != nil {
 		return fmt.Errorf("upsert IMAP sync state: %w", err)
+	}
+	if result.HasMore && !result.State.ActiveWindowSince.IsZero() {
+		if _, err := s.txExecContext(ctx, tx, `
+			INSERT INTO imap_active_windows(account_id, uid_validity, since_at)
+			VALUES(?, ?, ?)
+			ON CONFLICT(account_id) DO UPDATE SET
+				uid_validity = excluded.uid_validity, since_at = excluded.since_at`,
+			accountID, int64(result.State.UIDValidity), timestamp(result.State.ActiveWindowSince),
+		); err != nil {
+			return fmt.Errorf("upsert active IMAP window: %w", err)
+		}
+	} else if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_active_windows WHERE account_id = ?`, accountID); err != nil {
+		return fmt.Errorf("clear active IMAP window: %w", err)
 	}
 
 	syncStatus := domain.SyncStatusOK

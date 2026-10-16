@@ -12,7 +12,7 @@
 <body>
   <header>
     <h1>iCloud Mail · 接口与接入说明</h1>
-    <p>文档更新：2026-10-16 · v0.2.5。涵盖独立邮箱取码、项目邮箱池、已使用邮箱退役、按需收件与自动创建。HOST、ADMIN_PATH 和凭据均为示例占位符。</p>
+    <p>文档更新：2026-10-16 · v0.2.6。涵盖独立邮箱取码、项目邮箱池、已使用邮箱退役、按需收件与自动创建。HOST、ADMIN_PATH 和凭据均为示例占位符。</p>
   </header>
   <nav aria-label="文档目录">
     <a href="#otp">直接取码</a><a href="#pool">邮箱池</a><a href="#retirement">已使用邮箱退役</a><a href="#receiving">收件与并行</a><a href="#limits">限流与重试</a><a href="#creation">自动创建</a><a href="#imaps">IMAPS / OAuth</a>
@@ -86,8 +86,8 @@ POST /ADMIN_PATH/api/v1/pool/aliases/batch/jobs/OPERATION_ID/reconcile</pre>
 
   <section id="receiving">
     <h2>按需收件与退役并行</h2>
-    <p>IMAP 增量批次将匹配正文合并为一次 UID FETCH，默认每批最多处理 32 条 UID，失败不推进游标；不支持批量正文读取的服务器使用逐封回退。网页正文重建版仅在 Message-ID、旧文件校验和及来源标记核验一致时升级为完整 MIME，保留归档身份与取码记录。</p>
-    <p>默认按需接收。共享模式同主号复用一条 IDLE 通知连接及一条串行读取连接；无有效取件 10 分钟后休眠。取件需求到达且观察超过 5 秒时补查；正常增量按持久化 UID 继续。冷启动或久未同步仅检查最近 128 条候选头部，正文限最近 15 分钟。这些是调度规则，并非投递时延承诺。</p>
+    <p>IMAP 增量批次将匹配正文合并为一次 UID FETCH，服务默认每批最多处理 128 条 UID，失败不推进游标；不支持批量正文读取的服务器使用逐封回退。网页正文重建版仅在 Message-ID、旧文件校验和及来源标记核验一致时升级为完整 MIME，保留归档身份与取码记录。</p>
+    <p>默认按需接收。共享模式同主号复用一条 IDLE 通知连接及一条串行读取连接；无有效取件 10 分钟后休眠。取件需求到达且观察超过 5 秒时补查；正常增量按持久化 UID 继续。冷启动或久未同步按服务端日期筛选定位时间窗口，正文限最近 15 分钟，不截断为最后 128 封。待处理时间边界与游标同事务保存，分页及重启继续原窗口；旧 IMAP 服务器可能返回较多日期匹配的 UID 元数据。这些是调度规则，并非投递时延承诺。</p>
     <p class="note">同主号的 Apple 退役与 IMAP 网络读取可并行。Apple 管理与 IMAP 读取各自按主号串行；保存时用本地事务核验账户配置及每个邮箱身份。退役一个 alias 不再丢弃其他 alias 的整批结果，新加入但未参与本批的地址不会被误标为已同步。</p>
     <p>IMAP 密码、服务器、用户名、主号启停或收件通道变化使旧观察失效，包括停用后重启、配置切换后切回。retiring 租约立即停止 Pool 取码，其他邮箱继续收件。归档与 UID 同事务提交，未提交批次不推进游标。</p>
     <p>public IMAPS 仅读本地归档。上游 iCloud IMAP 使用主号配置的 <code>imap.mail.me.com:993</code>、TLS 和 Apple App 专用密码；它与网关签发的单邮箱 IMAP 密码是两套凭据。Apple Account 登录供隐藏邮箱管理使用，重新登录不会替换 IMAP App 专用密码。</p>
@@ -95,17 +95,18 @@ POST /ADMIN_PATH/api/v1/pool/aliases/batch/jobs/OPERATION_ID/reconcile</pre>
 
   <section id="limits">
     <h2>限流、空结果与重试</h2>
-    <p>同 root 的链接、Bearer Key 与 Pool code 共用容量 2 的令牌桶，每 2 秒恢复 1 次。一个普通读取与一个 Pool 长等待可共存；结束不追加冷却。被拦截刷新不扣额度、不重置恢复时间。旧非共享模式保留独占和完成后 2 秒冷却。</p>
+    <p>同 root 的链接、Bearer Key 与 Pool code 共用容量 2 的令牌桶，每 2 秒恢复 1 次。额度内的并发读者共享同步，普通读取与 Pool 长等待可共存；结束不追加冷却。被拦截刷新不扣额度、不重置恢复时间。旧非共享模式保留独占和完成后 2 秒冷却。</p>
     <div class="table-scroll"><table>
       <thead><tr><th>响应</th><th>处理方式</th></tr></thead><tbody>
       <tr><td>200 [] / no_code</td><td>正常读取完成，暂时无符合条件的新码；按任务 deadline 继续等待。</td></tr>
       <tr><td>429 RATE_LIMITED</td><td>按 Retry-After 秒数或 X-Retry-After-Ms 毫秒数重试，不叠加同 root 的多个长等待。</td></tr>
       <tr><td>503 SYNC_UNAVAILABLE</td><td>本次同步未完成或上游异常；按 Retry-After 与总 deadline 重试，区别于空结果。</td></tr>
+      <tr><td>503 PICKUP_BUSY</td><td>取件容量不足、队满或排队超时；按 Retry-After 重试，并发本身不返回 429。</td></tr>
       <tr><td>409 LEASE_CLOSED</td><td>租约关闭、到期或退役，停止该租约取件。</td></tr>
       <tr><td>401 INVALID_API_KEY / INVALID_POOL_KEY</td><td>核对凭据类型、有效性及轮换状态。</td></tr>
       </tbody></table></div>
-    <p>X-RateLimit-Reason 区分 mailbox_rate、mailbox_waiting、mailbox_inflight、mailbox_cooldown、account_concurrency、global_concurrency、global_rate、mailbox_capacity。在途完成时间未知时，只提供建议复查间隔。</p>
-    <p>共享入口上限：主号 64 个在途、全站 128 个、每秒 100 次；上游读取另受全局并发及最短 2 秒启动间隔约束。其他 Pool 路由保留每 IP 每分钟 300 次通用额度。限额按服务进程计数。</p>
+    <p>X-RateLimit-Reason 区分 mailbox_rate、mailbox_cooldown、global_queue、wait_queue、wait_concurrency、global_concurrency、mailbox_capacity；旧非共享路径还可能返回 mailbox_inflight、account_concurrency、global_rate。在途完成时间未知时，只提供建议复查间隔。</p>
+    <p>共享入口取消每主号 64 与每秒 100 次限制；全站允许 512 个在途、入口总计最多 1024 个请求（含排队），排队预算 2 秒。Pool 长等待最多 384 个在途、总计最多 640 个（含排队），为普通读取预留容量。上游仍共享连接并受全局并发及最短 2 秒启动间隔约束。其他 Pool 路由保留每 IP 每分钟 300 次通用额度。容量按服务进程计数。</p>
     <p>Apple 创建/删除限流与取件桶独立。退役沿用每主号串行、已有批量并发预算及 Apple Retry-After；未知结果先核验原工单。</p>
   </section>
 

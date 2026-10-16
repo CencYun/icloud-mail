@@ -314,6 +314,11 @@ test("account detail includes the normalized Apple session", async () => {
     region: "cn",
     authenticatedAt: "2026-08-07T08:00:00Z",
     expiresAt: null,
+    health: "",
+    lastRefreshedAt: null,
+    nextRefreshAt: null,
+    nextRetryAt: null,
+    refreshFailures: 0,
   });
 });
 
